@@ -1,0 +1,29 @@
+# AI / Vision / OCR
+anthropic==0.42.0
+google-genai==1.14.0
+pytesseract==0.3.13
+Pillow==11.1.0
+
+# Embeddings & Vector DB
+chromadb==0.5.23
+sentence-transformers==3.3.1
+
+# Knowledge Graph
+networkx==3.4.2
+
+# Content downloader
+instaloader
+yt-dlp==2024.12.23
+
+# Telegram Bot
+python-telegram-bot==21.9
+
+# Utils
+python-dotenv==1.0.1
+
+# CLI
+rich==13.9.4
+click==8.1.7
+
+# Graph visualization
+pyvis==0.3.2

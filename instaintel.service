@@ -1,0 +1,30 @@
+[Unit]
+Description=InstaIntel — Instagram Content Intelligence Pipeline
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/insta-intel
+ExecStart=/home/ubuntu/insta-intel/venv/bin/python main.py
+Restart=always
+RestartSec=30
+StandardOutput=append:/home/ubuntu/insta-intel/data/service.log
+StandardError=append:/home/ubuntu/insta-intel/data/service_error.log
+
+# Environment
+EnvironmentFile=/home/ubuntu/insta-intel/.env
+
+# Graceful shutdown
+TimeoutStopSec=30
+KillSignal=SIGTERM
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/home/ubuntu/insta-intel/data
+
+[Install]
+WantedBy=multi-user.target
