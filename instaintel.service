@@ -16,6 +16,7 @@ StandardError=append:/home/ubuntu/insta-intel/data/service_error.log
 
 # Environment
 EnvironmentFile=/home/ubuntu/insta-intel/.env
+Environment=PATH=/home/ubuntu/insta-intel/venv/bin:/usr/local/bin:/usr/bin:/bin
 
 # Graceful shutdown
 TimeoutStopSec=30

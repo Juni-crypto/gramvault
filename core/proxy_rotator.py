@@ -42,10 +42,13 @@ class ProxyRotator:
                 if r.ok:
                     for line in r.text.strip().splitlines():
                         line = line.strip()
-                        if line and ":" in line:
-                            proxy = line.split()[0]
-                            if proxy.count(":") == 1:
-                                raw_proxies.add(proxy)
+                        if not line:
+                            continue
+                        # Strip protocol prefix (Proxifly format: http://ip:port)
+                        proxy = line.split()[0]
+                        proxy = proxy.replace("http://", "").replace("https://", "")
+                        if proxy and proxy.count(":") == 1:
+                            raw_proxies.add(proxy)
                     log.info("[proxy] Fetched %d proxies from %s", len(raw_proxies), src.split("/")[-2])
             except Exception as e:
                 log.warning("[proxy] Source failed: %s", e)

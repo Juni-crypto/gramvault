@@ -13,7 +13,9 @@ Handles:
 
 import json
 import re
+import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -42,6 +44,21 @@ _SHORTCODE_RE = re.compile(r"instagram\.com/(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)
 
 # Proxy rotator (shared across all downloads)
 _proxy = ProxyRotator()
+
+
+def _find_ytdlp() -> str:
+    """Find yt-dlp binary — check venv bin first, then system PATH."""
+    # Check same directory as the running Python interpreter (venv/bin/)
+    venv_bin = Path(sys.executable).parent / "yt-dlp"
+    if venv_bin.exists():
+        return str(venv_bin)
+    # Check if it's on system PATH
+    found = shutil.which("yt-dlp")
+    if found:
+        return found
+    raise FileNotFoundError(
+        "yt-dlp not found. Install: pip install yt-dlp"
+    )
 
 
 # ─── Helpers ──────────────────────────────────────────────────
@@ -274,7 +291,8 @@ class ContentDownloader:
         proxy_args = ["--proxy", f"http://{proxy_str}"] if proxy_str else []
 
         # Step 1: Get metadata
-        meta_cmd = ["yt-dlp", "--dump-json"] + proxy_args + [url]
+        ytdlp = _find_ytdlp()
+        meta_cmd = [ytdlp, "--dump-json"] + proxy_args + [url]
         proc = subprocess.run(meta_cmd, capture_output=True, text=True, timeout=60)
         if proc.returncode != 0:
             raise RuntimeError(f"yt-dlp metadata failed: {proc.stderr[:300]}")
@@ -317,7 +335,7 @@ class ContentDownloader:
         else:
             # Download image(s) — no --no-playlist so carousels get all slides
             output = str(post_dir / f"ytdlp_%(autonumber)s.%(ext)s")
-            dl_cmd = ["yt-dlp", "-o", output] + proxy_args + [url]
+            dl_cmd = [ytdlp, "-o", output] + proxy_args + [url]
             subprocess.run(dl_cmd, check=True, timeout=120, capture_output=True)
 
             # Collect downloaded files
@@ -363,7 +381,7 @@ class ContentDownloader:
         if proxies:
             session.proxies.update(proxies)
 
-        # Step 1: Get the page (for cookies + token)
+        # Step 1: Get the page (for cookies + token + form action)
         log.info("[sss] Fetching sssinstagram.com...")
         page = session.get("https://sssinstagram.com/", timeout=15)
         page.raise_for_status()
@@ -372,19 +390,53 @@ class ContentDownloader:
         token_match = re.search(r'name="token"\s+value="([^"]+)"', page.text)
         if not token_match:
             token_match = re.search(r'"token"\s*:\s*"([^"]+)"', page.text)
+        if not token_match:
+            token_match = re.search(r"token['\"]?\s*[:=]\s*['\"]([a-f0-9]+)", page.text)
         token = token_match.group(1) if token_match else ""
         log.info("[sss] Token found: %s", bool(token))
 
-        # Step 2: Submit URL to API
+        # Extract form action URL from page
+        action_match = re.search(r'<form[^>]+action="([^"]+)"', page.text)
+        form_action = action_match.group(1) if action_match else None
+        log.info("[sss] Form action: %s", form_action)
+
+        # Step 2: Submit URL to API — try extracted action first, then common endpoints
         session.headers.update({
             "Referer": "https://sssinstagram.com/",
             "Origin": "https://sssinstagram.com",
+            "X-Requested-With": "XMLHttpRequest",
         })
-        resp = session.post(
+
+        api_endpoints = []
+        if form_action:
+            if form_action.startswith("http"):
+                api_endpoints.append(form_action)
+            else:
+                api_endpoints.append(f"https://sssinstagram.com{form_action}")
+        api_endpoints.extend([
             "https://sssinstagram.com/r",
-            data={"link": url, "token": token},
-            timeout=30,
-        )
+            "https://sssinstagram.com/api/ajax/fetch",
+            "https://sssinstagram.com/api/convert",
+        ])
+
+        resp = None
+        for endpoint in api_endpoints:
+            try:
+                log.info("[sss] Trying endpoint: %s", endpoint)
+                resp = session.post(
+                    endpoint,
+                    data={"link": url, "token": token, "url": url},
+                    timeout=30,
+                )
+                if resp.status_code != 404:
+                    log.info("[sss] Endpoint %s responded: %d", endpoint, resp.status_code)
+                    break
+                log.warning("[sss] Endpoint %s returned 404, trying next", endpoint)
+            except Exception as e:
+                log.warning("[sss] Endpoint %s failed: %s", endpoint, e)
+
+        if resp is None or resp.status_code == 404:
+            raise RuntimeError("sssinstagram: no working API endpoint found")
         resp.raise_for_status()
         log.info("[sss] API response: status=%d, len=%d", resp.status_code, len(resp.text))
 
@@ -521,11 +573,12 @@ class ContentDownloader:
     ) -> DownloadedContent:
         """Download a video (reel) via yt-dlp with retry + proxy rotation."""
         video_path = post_dir / f"{shortcode}.mp4"
+        ytdlp = _find_ytdlp()
 
         for attempt in range(3):
             proxy_str = _proxy.get()
             cmd = [
-                "yt-dlp",
+                ytdlp,
                 "-o", str(video_path),
                 "--no-playlist",
                 "--quiet",
