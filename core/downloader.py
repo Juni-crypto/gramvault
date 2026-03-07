@@ -361,7 +361,13 @@ class ContentDownloader:
     def _via_sssinstagram(
         self, url: str, shortcode: str, post_dir: Path
     ) -> tuple[MediaItem, DownloadedContent]:
-        """Download via sssinstagram.com API with proxy."""
+        """Download via sssinstagram.com API with proxy.
+
+        API endpoint: https://api-wh.sssinstagram.com/api/convert
+        Parameter: sf_url (the Instagram URL)
+        Note: Full HMAC signing requires chunk 54 from the site's webpack build.
+        Falls back to unsigned request which may or may not work.
+        """
         proxy_str = _proxy.get()
         proxies = {
             "http": f"http://{proxy_str}",
@@ -373,70 +379,33 @@ class ContentDownloader:
             "User-Agent": (
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
+                "Chrome/145.0.0.0 Safari/537.36"
             ),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept": "application/json, text/plain, */*",
             "Accept-Language": "en-US,en;q=0.9",
+            "Origin": "https://sssinstagram.com",
+            "Referer": "https://sssinstagram.com/",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-site",
         })
         if proxies:
             session.proxies.update(proxies)
 
-        # Step 1: Get the page (for cookies + token + form action)
-        log.info("[sss] Fetching sssinstagram.com...")
-        page = session.get("https://sssinstagram.com/", timeout=15)
-        page.raise_for_status()
+        # Step 1: Get the page (for cookies)
+        log.info("[sss] Fetching sssinstagram.com for cookies...")
+        try:
+            session.get("https://sssinstagram.com/", timeout=15)
+        except Exception as e:
+            log.warning("[sss] Could not load page for cookies: %s", e)
 
-        # Extract token from the page
-        token_match = re.search(r'name="token"\s+value="([^"]+)"', page.text)
-        if not token_match:
-            token_match = re.search(r'"token"\s*:\s*"([^"]+)"', page.text)
-        if not token_match:
-            token_match = re.search(r"token['\"]?\s*[:=]\s*['\"]([a-f0-9]+)", page.text)
-        token = token_match.group(1) if token_match else ""
-        log.info("[sss] Token found: %s", bool(token))
-
-        # Extract form action URL from page
-        action_match = re.search(r'<form[^>]+action="([^"]+)"', page.text)
-        form_action = action_match.group(1) if action_match else None
-        log.info("[sss] Form action: %s", form_action)
-
-        # Step 2: Submit URL to API — try extracted action first, then common endpoints
-        session.headers.update({
-            "Referer": "https://sssinstagram.com/",
-            "Origin": "https://sssinstagram.com",
-            "X-Requested-With": "XMLHttpRequest",
-        })
-
-        api_endpoints = []
-        if form_action:
-            if form_action.startswith("http"):
-                api_endpoints.append(form_action)
-            else:
-                api_endpoints.append(f"https://sssinstagram.com{form_action}")
-        api_endpoints.extend([
-            "https://sssinstagram.com/r",
-            "https://sssinstagram.com/api/ajax/fetch",
-            "https://sssinstagram.com/api/convert",
-        ])
-
-        resp = None
-        for endpoint in api_endpoints:
-            try:
-                log.info("[sss] Trying endpoint: %s", endpoint)
-                resp = session.post(
-                    endpoint,
-                    data={"link": url, "token": token, "url": url},
-                    timeout=30,
-                )
-                if resp.status_code != 404:
-                    log.info("[sss] Endpoint %s responded: %d", endpoint, resp.status_code)
-                    break
-                log.warning("[sss] Endpoint %s returned 404, trying next", endpoint)
-            except Exception as e:
-                log.warning("[sss] Endpoint %s failed: %s", endpoint, e)
-
-        if resp is None or resp.status_code == 404:
-            raise RuntimeError("sssinstagram: no working API endpoint found")
+        # Step 2: POST to the correct API endpoint
+        log.info("[sss] Calling api-wh.sssinstagram.com/api/convert...")
+        resp = session.post(
+            "https://api-wh.sssinstagram.com/api/convert",
+            data={"sf_url": url},
+            timeout=30,
+        )
         resp.raise_for_status()
         log.info("[sss] API response: status=%d, len=%d", resp.status_code, len(resp.text))
 
@@ -448,9 +417,18 @@ class ContentDownloader:
         content_type = resp.headers.get("content-type", "")
         if "application/json" in content_type:
             data = resp.json()
-            log.info("[sss] JSON keys: %s", list(data.keys()) if isinstance(data, dict) else type(data))
+            log.info("[sss] JSON response: %s", str(data)[:300])
+
+            # Check for error responses
             if isinstance(data, dict):
-                for key in ("data", "items", "media", "result", "urls"):
+                code = data.get("code", "")
+                info = data.get("info", "")
+                if "invalid_request" in str(code) or "error" in str(code).lower():
+                    raise RuntimeError(f"sssinstagram API error: {str(code)[:200]}")
+
+                # Parse the 'code' field which contains JS with embedded data
+                # Or parse direct media data
+                for key in ("data", "items", "media", "result", "urls", "url"):
                     if key in data:
                         items_list = data[key] if isinstance(data[key], list) else [data[key]]
                         for item_data in items_list:
@@ -462,10 +440,15 @@ class ContentDownloader:
                                 download_urls.append(item_data)
                 caption = data.get("caption", "") or data.get("description", "") or ""
                 author = data.get("username", "") or data.get("author", "") or ""
+
+                # Also extract URLs from the 'code' field (contains HTML with media URLs)
+                if code and not download_urls:
+                    cdn_urls = re.findall(
+                        r'(https?://(?:scontent|video|instagram)[^"\'\\]+)', str(code)
+                    )
+                    download_urls.extend(cdn_urls)
         else:
-            # Parse HTML response
             html = resp.text
-            # Find download URLs (Instagram CDN patterns)
             download_urls = re.findall(
                 r'href="(https?://(?:scontent|video|instagram)[^"]+)"', html
             )
