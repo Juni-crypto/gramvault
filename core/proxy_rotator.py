@@ -78,19 +78,22 @@ class ProxyRotator:
         candidates = raw[:80]
 
         working = []
-        log.info("Testing %d proxy candidates...", len(candidates))
-        for proxy in candidates:
+        log.info("[proxy] Testing %d proxy candidates (this takes ~30s)...", len(candidates))
+        for i, proxy in enumerate(candidates):
             if self._test_proxy(proxy):
                 working.append(proxy)
+                log.info("[proxy] Found working proxy %d/%d: %s", len(working), self._max, proxy)
                 if len(working) >= self._max:
                     break
+            if (i + 1) % 20 == 0:
+                log.info("[proxy] Tested %d/%d, found %d working so far", i + 1, len(candidates), len(working))
 
         with self._lock:
             self._proxies = working
             self._index = 0
             self._last_refresh = time.time()
 
-        log.info("Proxy pool: %d working proxies", len(working))
+        log.info("[proxy] Proxy pool ready: %d working proxies", len(working))
 
     def get(self) -> str | None:
         """Get next proxy (round-robin). Returns 'ip:port' or None."""

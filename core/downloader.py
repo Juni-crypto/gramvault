@@ -59,6 +59,7 @@ def _make_loader(proxy_str: str | None = None) -> instaloader.Instaloader:
         download_geotags=False,
         download_video_thumbnails=False,
         save_metadata=False,
+        max_connection_attempts=1,  # Don't retry internally — we handle rotation
     )
     if proxy_str:
         loader.context._session.proxies = {
@@ -71,29 +72,42 @@ def _make_loader(proxy_str: str | None = None) -> instaloader.Instaloader:
 def _get_post(shortcode: str, max_proxy_attempts: int = 5) -> instaloader.Post:
     """Fetch post metadata, rotating proxies on failure."""
     # First try without proxy (works on residential IPs)
+    log.info("[downloader] Attempting direct fetch for %s...", shortcode)
     try:
         loader = _make_loader()
-        return instaloader.Post.from_shortcode(loader.context, shortcode)
+        post = instaloader.Post.from_shortcode(loader.context, shortcode)
+        log.info("[downloader] Direct fetch succeeded for %s", shortcode)
+        return post
     except Exception as first_err:
-        log.warning("Direct fetch failed: %s — trying proxies", first_err)
+        log.warning("[downloader] Direct fetch failed: %s — switching to proxies", first_err)
+
+    # Load proxy pool if empty
+    if _proxy.count == 0:
+        log.info("[downloader] Proxy pool empty, fetching proxies...")
+        _proxy.refresh()
+        log.info("[downloader] Proxy pool loaded: %d proxies", _proxy.count)
 
     # Rotate through proxies
     for attempt in range(max_proxy_attempts):
         proxy_str = _proxy.get()
         if not proxy_str:
-            log.warning("No proxies available")
+            log.warning("[downloader] No proxies available (attempt %d/%d)", attempt + 1, max_proxy_attempts)
             break
 
+        log.info("[downloader] Trying proxy %d/%d: %s", attempt + 1, max_proxy_attempts, proxy_str)
         try:
             loader = _make_loader(proxy_str)
             post = instaloader.Post.from_shortcode(loader.context, shortcode)
-            log.info("Fetched via proxy %s", proxy_str)
+            log.info("[downloader] SUCCESS via proxy %s", proxy_str)
             return post
         except Exception as e:
-            log.debug("Proxy %s failed: %s", proxy_str, e)
+            log.warning("[downloader] Proxy %s failed: %s", proxy_str, e)
             _proxy.remove(proxy_str)
 
-    raise ConnectionError(f"Could not fetch {shortcode} — direct and {max_proxy_attempts} proxies all failed")
+    raise ConnectionError(
+        f"Could not fetch {shortcode} — direct and {max_proxy_attempts} proxies all failed. "
+        f"Proxy pool: {_proxy.count} remaining"
+    )
 
 
 def _extract_shortcode(url: str) -> str:
