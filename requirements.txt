@@ -16,7 +16,7 @@ instaloader
 yt-dlp==2024.12.23
 
 # Telegram Bot
-python-telegram-bot==21.9
+python-telegram-bot[job-queue]==21.9
 
 # Utils
 python-dotenv==1.0.1
