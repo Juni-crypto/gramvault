@@ -59,7 +59,7 @@ def _make_loader(proxy_str: str | None = None) -> instaloader.Instaloader:
         download_geotags=False,
         download_video_thumbnails=False,
         save_metadata=False,
-        max_connection_attempts=1,  # Don't retry internally — we handle rotation
+        max_connection_attempts=3,  # Let instaloader retry 3 times before we rotate
     )
     if proxy_str:
         loader.context._session.proxies = {
