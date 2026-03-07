@@ -1,7 +1,7 @@
-"""Proxy Rotator — Fetches and rotates free HTTPS proxies.
+"""Proxy Rotator — Fetches and rotates free proxies via Proxifly.
 
-Used by instaloader to bypass Instagram's datacenter IP blocking.
-Fetches proxy lists from public sources, validates them, and rotates.
+Proxifly validates proxies every 5 minutes from 82 countries.
+Used to bypass Instagram's datacenter IP blocking on EC2.
 """
 
 import random
@@ -12,20 +12,19 @@ import requests
 
 from utils.logger import log
 
-# Public proxy list sources (raw text, one IP:PORT per line)
+# Proxifly CDN — pre-validated, updated every 5 minutes
 _PROXY_SOURCES = [
-    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
-    "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
-    "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/https.txt",
+    "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/http/data.txt",
+    "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/https/data.txt",
 ]
 
 _TEST_URL = "https://www.instagram.com/favicon.ico"
 _TEST_TIMEOUT = 5
-_REFRESH_INTERVAL = 1800  # 30 minutes
+_REFRESH_INTERVAL = 600  # 10 minutes (Proxifly updates every 5)
 
 
 class ProxyRotator:
-    """Manages a pool of validated proxies."""
+    """Manages a pool of validated proxies from Proxifly."""
 
     def __init__(self, max_proxies: int = 20):
         self._proxies: list[str] = []
@@ -35,7 +34,7 @@ class ProxyRotator:
         self._last_refresh = 0.0
 
     def _fetch_proxy_list(self) -> list[str]:
-        """Fetch raw proxy list from public sources."""
+        """Fetch pre-validated proxies from Proxifly CDN."""
         raw_proxies = set()
         for src in _PROXY_SOURCES:
             try:
@@ -44,14 +43,14 @@ class ProxyRotator:
                     for line in r.text.strip().splitlines():
                         line = line.strip()
                         if line and ":" in line:
-                            # Some lists have extra columns, take just ip:port
                             proxy = line.split()[0]
                             if proxy.count(":") == 1:
                                 raw_proxies.add(proxy)
+                    log.info("[proxy] Fetched %d proxies from %s", len(raw_proxies), src.split("/")[-2])
             except Exception as e:
-                log.debug("Proxy source %s failed: %s", src, e)
+                log.warning("[proxy] Source failed: %s", e)
 
-        log.info("Fetched %d raw proxies from %d sources", len(raw_proxies), len(_PROXY_SOURCES))
+        log.info("[proxy] Total: %d unique proxies from Proxifly", len(raw_proxies))
         return list(raw_proxies)
 
     def _test_proxy(self, proxy: str) -> bool:
@@ -70,34 +69,32 @@ class ProxyRotator:
         """Fetch and validate proxies."""
         raw = self._fetch_proxy_list()
         if not raw:
-            log.warning("No proxies fetched from any source")
+            log.warning("[proxy] No proxies fetched")
             return
 
-        # Shuffle and test a sample (testing all would be too slow)
         random.shuffle(raw)
-        candidates = raw[:80]
+        candidates = raw[:100]
 
         working = []
-        log.info("[proxy] Testing %d proxy candidates (this takes ~30s)...", len(candidates))
+        log.info("[proxy] Testing %d candidates...", len(candidates))
         for i, proxy in enumerate(candidates):
             if self._test_proxy(proxy):
                 working.append(proxy)
-                log.info("[proxy] Found working proxy %d/%d: %s", len(working), self._max, proxy)
+                log.info("[proxy] Working %d/%d: %s", len(working), self._max, proxy)
                 if len(working) >= self._max:
                     break
-            if (i + 1) % 20 == 0:
-                log.info("[proxy] Tested %d/%d, found %d working so far", i + 1, len(candidates), len(working))
+            if (i + 1) % 25 == 0:
+                log.info("[proxy] Progress: tested %d, found %d working", i + 1, len(working))
 
         with self._lock:
             self._proxies = working
             self._index = 0
             self._last_refresh = time.time()
 
-        log.info("[proxy] Proxy pool ready: %d working proxies", len(working))
+        log.info("[proxy] Pool ready: %d working proxies", len(working))
 
     def get(self) -> str | None:
         """Get next proxy (round-robin). Returns 'ip:port' or None."""
-        # Auto-refresh if stale or empty
         if not self._proxies or (time.time() - self._last_refresh > _REFRESH_INTERVAL):
             self.refresh()
 
@@ -113,7 +110,7 @@ class ProxyRotator:
         with self._lock:
             if proxy in self._proxies:
                 self._proxies.remove(proxy)
-                log.debug("Removed dead proxy %s (%d remaining)", proxy, len(self._proxies))
+                log.debug("[proxy] Removed %s (%d left)", proxy, len(self._proxies))
 
     @property
     def count(self) -> int:

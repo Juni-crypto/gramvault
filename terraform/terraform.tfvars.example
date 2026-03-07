@@ -1,0 +1,21 @@
+# ============================================================
+# InstaIntel — Terraform Variables
+# ============================================================
+# Copy this file:  cp terraform.tfvars.example terraform.tfvars
+# Then fill in your values below.
+
+# Restrict SSH to your IP (find it: curl ifconfig.me)
+ssh_cidr = "0.0.0.0/0"
+
+# ─── API Keys ─────────────────────────────────────────────
+# Telegram: message @BotFather → /newbot
+telegram_bot_token = "your-bot-token"
+
+# Telegram: message @userinfobot
+telegram_allowed_users = "your-user-id"
+
+# Gemini: https://aistudio.google.com/apikey
+gemini_api_key = "your-gemini-key"
+
+# Anthropic: https://console.anthropic.com/
+anthropic_api_key = "sk-ant-xxxxx"

@@ -12,7 +12,7 @@ sentence-transformers==3.3.1
 networkx==3.4.2
 
 # Content downloader
-instaloader
+instaloader==4.13.1
 yt-dlp==2024.12.23
 
 # Telegram Bot

@@ -235,6 +235,37 @@ sudo systemctl enable instaintel   # auto-start on boot
 journalctl -u instaintel -f
 ```
 
+---
+
+## Deploy to AWS (Terraform)
+
+Go live in one command:
+
+```bash
+cd terraform
+cp terraform.tfvars.example terraform.tfvars
+# Edit terraform.tfvars with your API keys + SSH key name
+terraform init
+terraform apply
+```
+
+Bot is live in ~3 minutes. Check status:
+```bash
+terraform output ssh_command      # SSH in
+terraform output bot_logs         # Stream logs
+terraform output setup_log        # Check first-boot progress
+```
+
+Tear down:
+```bash
+terraform destroy                 # deletes everything
+```
+
+**What it creates:**
+- 1 EC2 instance (`t3.small`, ~$15/mo)
+- Security group (SSH only, all outbound)
+- Auto-installs Python, ffmpeg, clones repo, starts bot via systemd
+
 ## License
 
 MIT

@@ -15,6 +15,14 @@ __pycache__/
 .vscode/
 .idea/
 
+# Terraform
+*.tfstate
+*.tfstate.backup
+.terraform/
+.terraform.lock.hcl
+terraform.tfvars
+*.pem
+
 # OS
 .DS_Store
 Thumbs.db
