@@ -1,6 +1,7 @@
 """Content Downloader — Downloads Instagram content.
 
 Uses instaloader for metadata + images, yt-dlp for videos (reels).
+Auto-rotates free proxies on datacenter IPs (EC2).
 
 Handles:
 - Single image posts → downloads image
@@ -19,6 +20,7 @@ import requests
 
 from config import Config
 from core.models import MediaItem, MediaType
+from core.proxy_rotator import ProxyRotator
 from utils.logger import log
 
 
@@ -46,13 +48,52 @@ def _retry(func, max_retries=2, delay=3):
 
 _SHORTCODE_RE = re.compile(r"instagram\.com/(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)")
 
-# Shared instaloader instance (no login needed for public posts)
-_loader = instaloader.Instaloader(
-    download_comments=False,
-    download_geotags=False,
-    download_video_thumbnails=False,
-    save_metadata=False,
-)
+# Proxy rotator (shared across all downloads)
+_proxy = ProxyRotator()
+
+
+def _make_loader(proxy_str: str | None = None) -> instaloader.Instaloader:
+    """Create an instaloader instance, optionally with a proxy."""
+    loader = instaloader.Instaloader(
+        download_comments=False,
+        download_geotags=False,
+        download_video_thumbnails=False,
+        save_metadata=False,
+    )
+    if proxy_str:
+        loader.context._session.proxies = {
+            "http": f"http://{proxy_str}",
+            "https": f"http://{proxy_str}",
+        }
+    return loader
+
+
+def _get_post(shortcode: str, max_proxy_attempts: int = 5) -> instaloader.Post:
+    """Fetch post metadata, rotating proxies on failure."""
+    # First try without proxy (works on residential IPs)
+    try:
+        loader = _make_loader()
+        return instaloader.Post.from_shortcode(loader.context, shortcode)
+    except Exception as first_err:
+        log.warning("Direct fetch failed: %s — trying proxies", first_err)
+
+    # Rotate through proxies
+    for attempt in range(max_proxy_attempts):
+        proxy_str = _proxy.get()
+        if not proxy_str:
+            log.warning("No proxies available")
+            break
+
+        try:
+            loader = _make_loader(proxy_str)
+            post = instaloader.Post.from_shortcode(loader.context, shortcode)
+            log.info("Fetched via proxy %s", proxy_str)
+            return post
+        except Exception as e:
+            log.debug("Proxy %s failed: %s", proxy_str, e)
+            _proxy.remove(proxy_str)
+
+    raise ConnectionError(f"Could not fetch {shortcode} — direct and {max_proxy_attempts} proxies all failed")
 
 
 def _extract_shortcode(url: str) -> str:
@@ -78,8 +119,8 @@ class ContentDownloader:
         post_dir = Config.MEDIA_DIR / shortcode
         post_dir.mkdir(parents=True, exist_ok=True)
 
-        # Get metadata via instaloader
-        post = _retry(lambda: instaloader.Post.from_shortcode(_loader.context, shortcode))
+        # Get metadata via instaloader (with proxy rotation)
+        post = _get_post(shortcode)
 
         # Determine media type
         if post.is_video:
@@ -129,7 +170,7 @@ class ContentDownloader:
         post_dir.mkdir(parents=True, exist_ok=True)
 
         try:
-            post = _retry(lambda: instaloader.Post.from_shortcode(_loader.context, item.shortcode))
+            post = _get_post(item.shortcode)
 
             if item.media_type == MediaType.REEL:
                 result = self._download_video(item.url, item.shortcode, post_dir, result)
@@ -193,18 +234,19 @@ class ContentDownloader:
         video_path = post_dir / f"{shortcode}.mp4"
 
         def _do_download():
-            subprocess.run(
-                [
-                    "yt-dlp",
-                    "-o", str(video_path),
-                    "--no-playlist",
-                    "--quiet",
-                    "--merge-output-format", "mp4",
-                    url,
-                ],
-                check=True,
-                timeout=120,
-            )
+            cmd = [
+                "yt-dlp",
+                "-o", str(video_path),
+                "--no-playlist",
+                "--quiet",
+                "--merge-output-format", "mp4",
+            ]
+            # Use proxy if available
+            proxy_str = _proxy.get()
+            if proxy_str:
+                cmd += ["--proxy", f"http://{proxy_str}"]
+            cmd.append(url)
+            subprocess.run(cmd, check=True, timeout=120)
 
         try:
             _retry(_do_download)
