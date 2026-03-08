@@ -1,9 +1,8 @@
 """Content Downloader — Downloads Instagram content.
 
-Three-level fallback chain (all use Proxifly free proxies):
+Two-level fallback chain (all use Proxifly free proxies):
 1. instaloader + proxy (3 proxy attempts)
 2. yt-dlp + proxy
-3. sssinstagram.com API + proxy
 
 Handles:
 - Single image posts → downloads image
@@ -128,9 +127,9 @@ def _extract_shortcode(url: str) -> str:
 
 
 class ContentDownloader:
-    """Downloads Instagram content with 3-level fallback.
+    """Downloads Instagram content with 2-level fallback.
 
-    Fallback chain: instaloader → yt-dlp → sssinstagram.com
+    Fallback chain: instaloader → yt-dlp
     All methods use Proxifly free proxies for EC2 compatibility.
     """
 
@@ -140,7 +139,7 @@ class ContentDownloader:
     def download_url(self, url: str) -> tuple[MediaItem, DownloadedContent]:
         """Download content from an Instagram URL.
 
-        Tries instaloader → yt-dlp → sssinstagram.com
+        Tries instaloader → yt-dlp.
         Returns (MediaItem, DownloadedContent) tuple.
         """
         shortcode = _extract_shortcode(url)
@@ -165,13 +164,7 @@ class ContentDownloader:
             errors.append(f"yt-dlp: {e}")
             log.warning("[dl] yt-dlp failed: %s", e)
 
-        # === Method 3: sssinstagram.com + proxy ===
-        try:
-            log.info("[dl] === Method 3: sssinstagram for %s ===", shortcode)
-            return self._via_sssinstagram(url, shortcode, post_dir)
-        except Exception as e:
-            errors.append(f"sssinstagram: {e}")
-            log.error("[dl] ALL methods failed for %s: %s", shortcode, errors)
+        log.error("[dl] ALL methods failed for %s: %s", shortcode, errors)
 
         # All failed
         item = MediaItem(
@@ -223,18 +216,6 @@ class ContentDownloader:
                 return result
         except Exception as e:
             log.warning("[dl] yt-dlp pipeline failed: %s", e)
-
-        # === Method 3: sssinstagram ===
-        try:
-            log.info("[dl] Pipeline fallback: sssinstagram for %s", item.shortcode)
-            _, result = self._via_sssinstagram(item.url, item.shortcode, post_dir)
-            result.media_item = item
-            if item.media_type == MediaType.REEL and not skip_keyframes and result.video_path:
-                result.image_paths = self._extract_keyframes(result.video_path, post_dir)
-            if result.success:
-                return result
-        except Exception as e:
-            log.warning("[dl] sssinstagram pipeline failed: %s", e)
 
         log.error("[dl] ALL methods failed for pipeline download %s", item.shortcode)
         return DownloadedContent(media_item=item, success=False)
@@ -355,162 +336,6 @@ class ContentDownloader:
             len(result.image_paths), bool(result.video_path),
         )
         return item, result
-
-    # ─── Method 3: sssinstagram.com ──────────────────────────
-
-    def _via_sssinstagram(
-        self, url: str, shortcode: str, post_dir: Path
-    ) -> tuple[MediaItem, DownloadedContent]:
-        """Download via sssinstagram.com API with proxy.
-
-        API endpoint: https://api-wh.sssinstagram.com/api/convert
-        Parameter: sf_url (the Instagram URL)
-        Note: Full HMAC signing requires chunk 54 from the site's webpack build.
-        Falls back to unsigned request which may or may not work.
-        """
-        proxy_str = _proxy.get()
-        proxies = {
-            "http": f"http://{proxy_str}",
-            "https": f"http://{proxy_str}",
-        } if proxy_str else None
-
-        session = requests.Session()
-        session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/145.0.0.0 Safari/537.36"
-            ),
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Origin": "https://sssinstagram.com",
-            "Referer": "https://sssinstagram.com/",
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-site",
-        })
-        if proxies:
-            session.proxies.update(proxies)
-
-        # Step 1: Get the page (for cookies)
-        log.info("[sss] Fetching sssinstagram.com for cookies...")
-        try:
-            session.get("https://sssinstagram.com/", timeout=15)
-        except Exception as e:
-            log.warning("[sss] Could not load page for cookies: %s", e)
-
-        # Step 2: POST to the correct API endpoint
-        log.info("[sss] Calling api-wh.sssinstagram.com/api/convert...")
-        resp = session.post(
-            "https://api-wh.sssinstagram.com/api/convert",
-            data={"sf_url": url},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        log.info("[sss] API response: status=%d, len=%d", resp.status_code, len(resp.text))
-
-        # Step 3: Parse response for download URLs
-        download_urls = []
-        caption = ""
-        author = ""
-
-        content_type = resp.headers.get("content-type", "")
-        if "application/json" in content_type:
-            data = resp.json()
-            log.info("[sss] JSON response: %s", str(data)[:300])
-
-            # Check for error responses
-            if isinstance(data, dict):
-                code = data.get("code", "")
-                info = data.get("info", "")
-                if "invalid_request" in str(code) or "error" in str(code).lower():
-                    raise RuntimeError(f"sssinstagram API error: {str(code)[:200]}")
-
-                # Parse the 'code' field which contains JS with embedded data
-                # Or parse direct media data
-                for key in ("data", "items", "media", "result", "urls", "url"):
-                    if key in data:
-                        items_list = data[key] if isinstance(data[key], list) else [data[key]]
-                        for item_data in items_list:
-                            if isinstance(item_data, dict):
-                                for url_key in ("url", "download_url", "thumb", "image", "video"):
-                                    if url_key in item_data and item_data[url_key]:
-                                        download_urls.append(item_data[url_key])
-                            elif isinstance(item_data, str) and item_data.startswith("http"):
-                                download_urls.append(item_data)
-                caption = data.get("caption", "") or data.get("description", "") or ""
-                author = data.get("username", "") or data.get("author", "") or ""
-
-                # Also extract URLs from the 'code' field (contains HTML with media URLs)
-                if code and not download_urls:
-                    cdn_urls = re.findall(
-                        r'(https?://(?:scontent|video|instagram)[^"\'\\]+)', str(code)
-                    )
-                    download_urls.extend(cdn_urls)
-        else:
-            html = resp.text
-            download_urls = re.findall(
-                r'href="(https?://(?:scontent|video|instagram)[^"]+)"', html
-            )
-            if not download_urls:
-                download_urls = re.findall(
-                    r'"(https?://(?:scontent|video|instagram)[^"]*\.(?:jpg|jpeg|png|mp4)[^"]*)"',
-                    html,
-                )
-
-        if not download_urls:
-            log.warning("[sss] No URLs found. Response preview: %s", resp.text[:500])
-            raise RuntimeError(f"sssinstagram returned no download URLs for {shortcode}")
-
-        log.info("[sss] Found %d download URLs", len(download_urls))
-
-        # Step 4: Download the files
-        image_paths = []
-        video_path = None
-
-        for i, dl_url in enumerate(download_urls):
-            try:
-                r = session.get(dl_url, timeout=30)
-                r.raise_for_status()
-                ct = r.headers.get("content-type", "")
-
-                if "video" in ct or dl_url.endswith(".mp4"):
-                    path = post_dir / f"{shortcode}.mp4"
-                    path.write_bytes(r.content)
-                    video_path = path
-                    log.info("[sss] Downloaded video: %s (%d bytes)", path, len(r.content))
-                else:
-                    path = post_dir / f"ss_{i}.jpg"
-                    path.write_bytes(r.content)
-                    image_paths.append(path)
-                    log.info("[sss] Downloaded image %d: %s (%d bytes)", i, path, len(r.content))
-            except Exception as e:
-                log.warning("[sss] Download %d failed: %s", i, e)
-
-        # Determine media type
-        if video_path:
-            media_type = MediaType.REEL
-        elif len(image_paths) > 1:
-            media_type = MediaType.CAROUSEL
-        else:
-            media_type = MediaType.IMAGE
-
-        media_item = MediaItem(
-            media_id=shortcode, shortcode=shortcode,
-            media_type=media_type, url=url,
-            caption=caption, author_username=author,
-        )
-        result = DownloadedContent(
-            media_item=media_item, caption=caption,
-            image_paths=image_paths, video_path=video_path,
-            success=len(image_paths) > 0 or video_path is not None,
-        )
-
-        if not result.success:
-            raise RuntimeError(f"sssinstagram downloaded 0 files for {shortcode}")
-
-        log.info("[sss] Done: %d images, video=%s", len(image_paths), bool(video_path))
-        return media_item, result
 
     # ─── Shared download helpers ─────────────────────────────
 

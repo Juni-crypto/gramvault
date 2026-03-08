@@ -1,6 +1,6 @@
 """Telegram Bot — Claude-powered RAG chat + Instagram URL processing.
 
-Send an Instagram URL -> downloads, analyzes, indexes the content.
+Send an Instagram URL -> queued, processed one per minute, indexed.
 Ask any question -> Claude searches your saved content and answers.
 
 Commands:
@@ -11,12 +11,14 @@ Commands:
     /category   — Browse categories
     /graph      — Knowledge graph visualization
     /cost       — AI API usage & costs
+    /queue      — Check URL processing queue
     /flush      — Delete all saved data
-    <URL>       — Process an Instagram post/reel
+    <URL>       — Queue an Instagram post/reel for processing
     <any text>  — Claude-powered search & answer
 """
 
 import asyncio
+import collections
 import json
 import re
 import shutil
@@ -60,8 +62,23 @@ _INSTAGRAM_URL_RE = re.compile(
     r"https?://(?:www\.)?instagram\.com/(?:p|reel|reels|tv)/[A-Za-z0-9_-]+"
 )
 
+_SHORTCODE_RE = re.compile(
+    r"instagram\.com/(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)"
+)
+
 # IST = UTC+5:30
 _IST = timezone(timedelta(hours=5, minutes=30))
+
+# ─── URL Processing Queue ─────────────────────────────────
+# Each item: (url, chat_id, user_id)
+_url_queue: collections.deque = collections.deque()
+
+# Processing stats for daily digest (reset nightly)
+_processing_stats = {
+    "processed": 0,
+    "failed": 0,
+    "errors": [],   # list of {"url": str, "reason": str}
+}
 
 
 def _check_authorized(user_id: int) -> bool:
@@ -204,7 +221,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     welcome += (
         "*How to use:*\n"
-        "1. Send any Instagram URL to save & analyze\n"
+        "1. Send any Instagram URL(s) to queue & analyze\n"
         "2. Ask anything about your saved content\n\n"
         "*Commands:*\n"
         "/stats  - Library overview\n"
@@ -212,6 +229,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/recent - Last 5 saved posts\n"
         "/category - Browse by category\n"
         "/graph  - Knowledge graph visualization\n"
+        "/queue  - Check processing queue\n"
         "/cost   - AI API usage & costs\n"
         "/flush  - Clear all saved data\n\n"
         "*Try asking:*\n"
@@ -231,12 +249,14 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     v_stats = _vectors.get_stats()
     g_stats = _graph.get_stats()
     today_count = len(_db.get_today_posts())
+    queue_count = len(_url_queue)
 
     text = (
         f"*InstaIntel Stats*\n"
         f"{'=' * 25}\n\n"
         f"Total posts: *{db_stats['total_posts']}*\n"
-        f"Added today: *{today_count}*\n\n"
+        f"Added today: *{today_count}*\n"
+        f"Queue pending: *{queue_count}*\n\n"
     )
 
     type_icons = {"image": "IMG", "carousel": "SLIDES", "reel": "REEL"}
@@ -478,47 +498,51 @@ async def handle_instagram_url(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     text = update.message.text.strip()
-    match = _INSTAGRAM_URL_RE.search(text)
-    if not match:
+    urls = _INSTAGRAM_URL_RE.findall(text)
+    if not urls:
         return
 
-    url = match.group(0)
-    log.info("Instagram URL received from user %s: %s", update.effective_user.id, url)
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
 
-    msg = await update.message.reply_text("Processing... downloading and analyzing.")
+    queued_count = 0
+    skipped_dup = 0
 
-    try:
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, _pipeline.process_url, url)
+    queued_urls = {item[0] for item in list(_url_queue)}
 
-        if result["status"] == "duplicate":
-            summary = result.get("summary", "No summary")
-            await msg.edit_text(
-                f"Already saved!\n\n"
-                f"*Summary:* {summary}\n"
-                f"*Category:* {result.get('category', 'N/A')}\n"
-                f"*Author:* @{result.get('author', 'unknown')}",
-                parse_mode="Markdown",
+    for url in urls:
+        m = _SHORTCODE_RE.search(url)
+        if not m:
+            continue
+        shortcode = m.group(1)
+
+        # Skip already processed
+        if _db.is_url_processed(shortcode) or _db.get_post(shortcode):
+            skipped_dup += 1
+            continue
+
+        # Skip if already in queue
+        if url in queued_urls:
+            continue
+
+        _url_queue.append((url, chat_id, user_id))
+        queued_urls.add(url)
+        queued_count += 1
+
+    # Build reply
+    if queued_count == 0:
+        if skipped_dup > 0:
+            await update.message.reply_text(
+                f"All {skipped_dup} URL(s) already saved. Ask me about them!"
             )
-        elif result["status"] == "processed":
-            summary = result.get("summary", "No summary")
-            await msg.edit_text(
-                f"Saved and indexed!\n\n"
-                f"*Summary:* {summary}\n"
-                f"*Category:* {result.get('category', 'N/A')}\n"
-                f"*Author:* @{result.get('author', 'unknown')}\n\n"
-                f"Ask me anything about this content!",
-                parse_mode="Markdown",
-            )
+        return
 
-            # Send images as album
-            await _send_images_album(update, result.get("shortcode", ""))
-        else:
-            await msg.edit_text(f"Failed: {result.get('error', 'Unknown error')}")
+    parts = [f"Added {queued_count} URL(s) to queue."]
+    if skipped_dup:
+        parts.append(f"({skipped_dup} already saved, skipped.)")
 
-    except Exception as e:
-        log.error("URL processing failed: %s", e)
-        await msg.edit_text(f"Error: {e}")
+    await update.message.reply_text(" ".join(parts))
+    log.info("Queued %d URLs from user %s. Queue size: %d", queued_count, user_id, len(_url_queue))
 
 
 async def _send_images_album(update: Update, shortcode: str):
@@ -548,6 +572,61 @@ async def _send_images_album(update: Update, shortcode: str):
             await update.message.reply_media_group(media=media_group)
     except Exception as e:
         log.warning("Failed to send images album: %s", e)
+
+
+# ─── Queue Processor ─────────────────────────────────────────
+
+async def _process_queue(context: ContextTypes.DEFAULT_TYPE):
+    """Job: pop one URL from queue and process it silently. Runs every 60s."""
+    if not _url_queue:
+        return
+
+    url, chat_id, user_id = _url_queue.popleft()
+    log.info("[queue] Processing: %s (remaining: %d)", url, len(_url_queue))
+
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, _pipeline.process_url, url)
+
+        if result["status"] in ("duplicate", "processed"):
+            _processing_stats["processed"] += 1
+        else:
+            _processing_stats["failed"] += 1
+            _processing_stats["errors"].append({
+                "url": url,
+                "reason": result.get("error", "Unknown error"),
+            })
+    except Exception as e:
+        log.error("[queue] Processing failed for %s: %s", url, e)
+        _processing_stats["failed"] += 1
+        _processing_stats["errors"].append({"url": url, "reason": str(e)})
+
+    # Keep errors list bounded
+    if len(_processing_stats["errors"]) > 20:
+        _processing_stats["errors"] = _processing_stats["errors"][-20:]
+
+
+async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show URL processing queue status."""
+    if not _check_authorized(update.effective_user.id):
+        return
+
+    q_len = len(_url_queue)
+    if q_len == 0:
+        await update.message.reply_text("Queue is empty. Send Instagram URLs to add them!")
+        return
+
+    lines = [f"*Queue Status* — {q_len} URL(s) pending\n"]
+    for i, (url, _, _) in enumerate(list(_url_queue)):
+        sc = _SHORTCODE_RE.search(url)
+        label = sc.group(1) if sc else url[-20:]
+        lines.append(f"{i+1}. {label}")
+        if i >= 9:
+            lines.append(f"... and {q_len - 10} more")
+            break
+
+    lines.append(f"\nETA: ~{q_len} min (1 per minute)")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 # ─── Main Message Handler (Claude RAG) ────────────────────────
@@ -595,11 +674,29 @@ async def _daily_digest(context: ContextTypes.DEFAULT_TYPE):
     total_stats = _db.get_stats()
     g_stats = _graph.get_stats()
 
+    # Capture and reset processing stats
+    processed = _processing_stats["processed"]
+    failed = _processing_stats["failed"]
+    errors_snapshot = list(_processing_stats["errors"])
+    queue_remaining = len(_url_queue)
+
+    _processing_stats["processed"] = 0
+    _processing_stats["failed"] = 0
+    _processing_stats["errors"] = []
+
+    # Stats line
+    total_attempts = processed + failed
+    success_rate = int((processed / total_attempts) * 100) if total_attempts > 0 else 0
+    stats_line = f"Processed: {processed} | Failed: {failed} | Success: {success_rate}%"
+    if queue_remaining:
+        stats_line += f" | Queue: {queue_remaining} pending"
+
     if not today_posts:
         text = (
             "*Daily Digest*\n"
             f"{'=' * 25}\n\n"
             "No new posts saved today.\n\n"
+            f"*Processing:* {stats_line}\n\n"
             f"*Library total:* {total_stats['total_posts']} posts\n"
             f"*Graph:* {g_stats['total_nodes']} nodes\n\n"
             "Send some Instagram URLs tomorrow!"
@@ -615,6 +712,7 @@ async def _daily_digest(context: ContextTypes.DEFAULT_TYPE):
             "*Daily Digest*\n"
             f"{'=' * 25}\n\n"
             f"*Today:* {len(today_posts)} new posts saved\n"
+            f"*Processing:* {stats_line}\n"
             f"*Library total:* {total_stats['total_posts']} posts\n\n"
         )
 
@@ -631,6 +729,14 @@ async def _daily_digest(context: ContextTypes.DEFAULT_TYPE):
         if top_topics:
             topics_str = ", ".join(f"#{t[0]}" for t in top_topics)
             text += f"*Trending topics:* {topics_str}\n"
+
+    # Append error details if any
+    if errors_snapshot:
+        text += f"\n*Errors ({len(errors_snapshot)}):*\n"
+        for err in errors_snapshot[-10:]:
+            short_url = err["url"].split("/")[-1][:20]
+            reason = err["reason"][:80]
+            text += f"  {short_url}: {reason}\n"
 
     # Send to all authorized users
     for user_id in Config.TELEGRAM_ALLOWED_USERS:
@@ -652,7 +758,7 @@ async def _daily_digest(context: ContextTypes.DEFAULT_TYPE):
         if freed:
             log.info("Nightly cleanup: freed %.1f MB of media", freed / (1024 * 1024))
 
-    log.info("Daily digest sent: %d posts today", len(today_posts))
+    log.info("Daily digest sent: %d posts today, %d processed, %d failed", len(today_posts), processed, failed)
 
 
 # ─── Bot Startup ──────────────────────────────────────────────
@@ -696,6 +802,7 @@ def start_bot():
     app.add_handler(CommandHandler("graph", cmd_graph))
     app.add_handler(CommandHandler("flush", cmd_flush))
     app.add_handler(CommandHandler("cost", cmd_cost))
+    app.add_handler(CommandHandler("queue", cmd_queue))
 
     # URL handler BEFORE catch-all text handler
     app.add_handler(MessageHandler(
@@ -712,6 +819,15 @@ def start_bot():
         name="daily_digest",
     )
     log.info("Daily digest scheduled at 00:00 IST (18:30 UTC)")
+
+    # Process queue: one URL every 60 seconds
+    job_queue.run_repeating(
+        _process_queue,
+        interval=60,
+        first=10,
+        name="process_queue",
+    )
+    log.info("URL processing queue started (interval: 60s)")
 
     log.info(
         "Telegram bot started | Users: %s | Claude: %s",

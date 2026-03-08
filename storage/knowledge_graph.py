@@ -246,45 +246,130 @@ class KnowledgeGraph:
     # ─── Visualization ────────────────────────────────────────────────
 
     def export_html(self, output_path: Path | None = None) -> Path:
-        """Export interactive graph visualization as HTML using pyvis."""
-        try:
-            from pyvis.network import Network
+        """Export interactive graph visualization as a self-contained vis.js HTML file."""
+        out = output_path or (Config.DATA_DIR / "graph.html")
 
-            net = Network(
-                height="800px",
-                width="100%",
-                bgcolor="#0a0a0f",
-                font_color="#e2e8f0",
-                directed=False,
-            )
+        TYPE_COLORS = {
+            "post": "#8b5cf6", "topic": "#22c55e", "person": "#3b82f6",
+            "brand": "#f59e0b", "product": "#ec4899", "location": "#06b6d4",
+            "category": "#ef4444",
+        }
+        TYPE_SHAPES = {
+            "post": "triangle", "topic": "dot", "person": "square",
+            "brand": "diamond", "product": "star", "location": "ellipse",
+            "category": "hexagon",
+        }
 
-            # Color map by node type
-            colors = {
-                "post": "#8b5cf6",
-                "topic": "#22c55e",
-                "person": "#3b82f6",
-                "brand": "#f59e0b",
-                "product": "#ec4899",
-                "location": "#06b6d4",
-                "category": "#ef4444",
-            }
+        vis_nodes = []
+        for node, data in self.G.nodes(data=True):
+            node_type = data.get("node_type", "unknown")
+            raw_label = data.get("name", data.get("shortcode", node))
+            label = (raw_label[:25] + "\u2026") if len(raw_label) > 25 else raw_label
+            vis_nodes.append({
+                "id": node, "label": label,
+                "title": f"{node_type}: {raw_label}",
+                "color": TYPE_COLORS.get(node_type, "#64748b"),
+                "shape": TYPE_SHAPES.get(node_type, "dot"),
+                "size": 20 if node_type == "post" else 12,
+                "font": {"size": 11, "color": "#e6edf3"},
+            })
 
-            for node, data in self.G.nodes(data=True):
-                node_type = data.get("node_type", "unknown")
-                label = data.get("name", data.get("shortcode", node))
-                color = colors.get(node_type, "#64748b")
-                size = 15 if node_type == "post" else 10
-                net.add_node(node, label=label, color=color, size=size, title=f"{node_type}: {label}")
+        vis_edges = []
+        for u, v, data in self.G.edges(data=True):
+            weight = data.get("weight", 1)
+            vis_edges.append({
+                "from": u, "to": v, "width": min(weight, 5),
+                "color": {"color": "#334155", "highlight": "#94a3b8"},
+            })
 
-            for u, v, data in self.G.edges(data=True):
-                weight = data.get("weight", 1)
-                net.add_edge(u, v, width=min(weight, 5))
+        nodes_json = json.dumps(vis_nodes)
+        edges_json = json.dumps(vis_edges)
 
-            out = output_path or (Config.DATA_DIR / "graph.html")
-            net.save_graph(str(out))
-            log.info("Graph visualization exported to %s", out)
-            return out
+        legend_items = "".join(
+            f'<div style="display:flex;align-items:center;gap:6px;margin:3px 0">'
+            f'<span style="display:inline-block;width:12px;height:12px;'
+            f'background:{color};border-radius:2px"></span>'
+            f'<span style="font-size:11px;color:#94a3b8">{ntype}</span></div>'
+            for ntype, color in TYPE_COLORS.items()
+        )
 
-        except ImportError:
-            log.warning("pyvis not installed. Run: pip install pyvis")
-            return Config.DATA_DIR / "graph.html"
+        html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>InstaIntel Knowledge Graph</title>
+<script src="https://cdn.jsdelivr.net/npm/vis-network@9.1.9/dist/vis-network.min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/vis-network@9.1.9/dist/dist/vis-network.min.css">
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{background:#0d1117;color:#e6edf3;font-family:-apple-system,sans-serif;overflow:hidden}}
+#graph{{width:100vw;height:100vh}}
+#controls{{position:absolute;top:12px;left:12px;z-index:10;display:flex;gap:8px;align-items:center}}
+#search{{background:#161b22;border:1px solid #30363d;color:#e6edf3;padding:6px 10px;border-radius:6px;font-size:13px;width:200px;outline:none}}
+#search::placeholder{{color:#6e7681}}
+.btn{{background:#21262d;border:1px solid #30363d;color:#e6edf3;padding:6px 12px;border-radius:6px;cursor:pointer;font-size:13px}}
+.btn:hover{{background:#30363d}}
+#legend{{position:absolute;top:12px;right:12px;z-index:10;background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px 14px}}
+#legend h4{{font-size:11px;color:#6e7681;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px}}
+#node-info{{position:absolute;bottom:16px;left:50%;transform:translateX(-50%);background:#161b22;border:1px solid #30363d;border-radius:8px;padding:8px 16px;font-size:13px;color:#e6edf3;max-width:500px;text-align:center;display:none;z-index:10}}
+</style>
+</head>
+<body>
+<div id="controls">
+  <input id="search" type="text" placeholder="Search nodes\u2026"/>
+  <button class="btn" id="search-btn">Find</button>
+  <button class="btn" id="reset-btn">Reset view</button>
+</div>
+<div id="legend"><h4>Legend</h4>{legend_items}</div>
+<div id="graph"></div>
+<div id="node-info"></div>
+<script>
+const nodesData={nodes_json};
+const edgesData={edges_json};
+const nodes=new vis.DataSet(nodesData);
+const edges=new vis.DataSet(edgesData);
+const options={{
+  physics:{{solver:"barnesHut",barnesHut:{{gravitationalConstant:-8000,centralGravity:0.3,springLength:150,springConstant:0.04,damping:0.09}},stabilization:{{iterations:200}}}},
+  interaction:{{hover:true,tooltipDelay:200,hideEdgesOnDrag:true}},
+  edges:{{smooth:{{type:"continuous"}},color:{{color:"#334155",highlight:"#94a3b8"}}}},
+  nodes:{{borderWidth:0,chosen:true}}
+}};
+const container=document.getElementById("graph");
+const network=new vis.Network(container,{{nodes,edges}},options);
+network.on("click",function(params){{
+  const info=document.getElementById("node-info");
+  if(params.nodes.length===0){{
+    nodes.update(nodesData.map(n=>({{id:n.id,opacity:1.0}})));
+    info.style.display="none";
+    return;
+  }}
+  const nodeId=params.nodes[0];
+  const nd=nodes.get(nodeId);
+  info.textContent=nd.title||nd.label;
+  info.style.display="block";
+  const connected=new Set(network.getConnectedNodes(nodeId));
+  connected.add(nodeId);
+  nodes.update(nodesData.map(n=>({{id:n.id,opacity:connected.has(n.id)?1.0:0.1}})));
+}});
+document.getElementById("search-btn").addEventListener("click",()=>{{
+  const q=document.getElementById("search").value.trim().toLowerCase();
+  if(!q)return;
+  const match=nodesData.find(n=>n.label.toLowerCase().includes(q)||n.title.toLowerCase().includes(q));
+  if(match){{network.focus(match.id,{{scale:1.5,animation:true}});network.selectNodes([match.id]);}}
+}});
+document.getElementById("search").addEventListener("keydown",e=>{{
+  if(e.key==="Enter")document.getElementById("search-btn").click();
+}});
+document.getElementById("reset-btn").addEventListener("click",()=>{{
+  network.fit({{animation:true}});
+  nodes.update(nodesData.map(n=>({{id:n.id,opacity:1.0}})));
+  document.getElementById("node-info").style.display="none";
+}});
+</script>
+</body>
+</html>"""
+
+        out.write_text(html, encoding="utf-8")
+        log.info("Graph exported to %s (%d nodes, %d edges)", out, len(vis_nodes), len(vis_edges))
+        return out
